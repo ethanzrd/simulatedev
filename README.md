@@ -6,7 +6,7 @@ SimulateDev is an automation tool that runs AI coding agents (Cursor, Devin, Cla
 For additional scripts and utilities, see the [scripts directory](scripts/README.md).
 
 
-https://github.com/user-attachments/assets/13b35289-3f38-4a46-a176-9c8e85892fe9
+[![SimulateDev demo video](https://github.com/user-attachments/assets/13b35289-3f38-4a46-a176-9c8e85892fe9)](https://github.com/user-attachments/assets/13b35289-3f38-4a46-a176-9c8e85892fe9)
 
 👆 This video shows how SimulateDev addresses an [open issue](https://github.com/tavily-ai/tavily-python/issues/93) in Tavily's Python repository, submitting a [pull request](https://github.com/tavily-ai/tavily-python/pull/118) to solve it.
 
@@ -20,10 +20,15 @@ https://github.com/user-attachments/assets/13b35289-3f38-4a46-a176-9c8e85892fe9
 - **Permissions Required**: GitHub token needs `repo` permissions. Cursor/Windsurf require Automation & Accessibility permissions in System Settings → Privacy & Security
 
 ## Run SimulateDev in <1 min
-Clone this repo → Create virtual environment → Install requirements.txt → Copy .env.example into .env and replace API keys → Run the following command (replace to your coding IDE of choice and GitHub repo url):
-```bash
-python simulatedev.py --workflow bugs --repo https://github.com/saharmor/gemini-multimodal-playground --agent cursor
-```
+
+1. **Clone** this repo
+2. **Create** a virtual environment
+3. **Install** `requirements.txt`
+4. **Copy** `.env.example` to `.env` and add your API keys
+5. **Run** the following command (replace the agent and repo URL as needed):
+   ```bash
+   python simulatedev.py --workflow bugs --repo https://github.com/saharmor/gemini-multimodal-playground --agent cursor
+   ```
 
 
 ## Features
