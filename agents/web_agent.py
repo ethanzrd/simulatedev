@@ -10,13 +10,22 @@ import asyncio
 import time
 import os
 from abc import abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from .base import CodingAgent, AgentResponse
 from common.exceptions import AgentTimeoutException
 from common.config import config
 
 import botright
 
+
+class WebAutomationConfig:
+    DEFAULT_TIMEOUT = 30000  # 30 seconds
+    SHORT_TIMEOUT = 10000    # 10 seconds
+    LONG_TIMEOUT = 60000     # 60 seconds
+    RETRY_COUNT = 3
+    RETRY_DELAY = 2000       # 2 seconds
+    ELEMENT_STABILITY_TIMEOUT = 1000  # 1 second
+    NETWORK_IDLE_TIMEOUT = 5000       # 5 seconds
 
 # Selector constants for Google authentication
 class GoogleSelectors:
@@ -62,6 +71,7 @@ class WebAgent(CodingAgent):
         self.browser = None
         self.page = None
         self._is_browser_ready = False
+        self.config = WebAutomationConfig()
     
     @property
     def window_name(self) -> str:
@@ -186,11 +196,14 @@ class WebAgent(CodingAgent):
             # Create new page
             self.page = await self.browser.new_page()
             
-            # Navigate to the web agent URL
-            await self.page.goto(self.web_url)
+            self.page.set_default_timeout(self.config.DEFAULT_TIMEOUT)
+            self.page.set_default_navigation_timeout(self.config.LONG_TIMEOUT)
             
-            # Wait for page to load
-            await self.page.wait_for_load_state("networkidle")
+            # Navigate to the web agent URL with retry
+            navigation_success = await self._robust_navigate(self.web_url)
+            if not navigation_success:
+                print(f"ERROR: Failed to navigate to {self.web_url}")
+                return False
             
             # Perform any agent-specific setup
             setup_success = await self._setup_web_interface()
@@ -241,18 +254,23 @@ class WebAgent(CodingAgent):
         """Perform agent-specific setup after navigation. Override in subclasses."""
         # Default implementation - subclasses can override for specific setup
         try:
-            # Example: Handle Google login if redirected to Google login page
-            # if 'accounts.google.com' in self.page.url:
-            #     await self.handle_google_login()
-            
             # Solve any captchas that might appear
             await self.solve_captcha_if_present()
             
-            # Wait for input field to be available
-            await self.page.wait_for_selector(self.input_selector, timeout=10000)
+            # Wait for input field to be available with robust waiting
+            input_available = await self._wait_for_element_robust(
+                self.input_selector, 
+                "input field",
+                timeout=self.config.DEFAULT_TIMEOUT
+            )
+            
+            if not input_available:
+                print(f"ERROR: Could not find input field for {self.agent_name}")
+                return False
+                
             return True
         except Exception as e:
-            print(f"ERROR: Could not find input field for {self.agent_name}: {str(e)}")
+            print(f"ERROR: Setup failed for {self.agent_name}: {str(e)}")
             return False
     
     async def execute_prompt(self, prompt: str) -> AgentResponse:
@@ -287,20 +305,17 @@ class WebAgent(CodingAgent):
     async def _send_prompt_to_web_interface(self, prompt: str):
         """Send prompt to the web interface"""
         try:
-            # Focus on input field
-            await self.page.click(self.input_selector)
+            success = await self._robust_fill_input(self.input_selector, prompt)
+            if not success:
+                raise Exception("Failed to fill input field")
             
-            # Clear any existing content
-            await self.page.fill(self.input_selector, "")
+            success = await self._robust_click_element(self.submit_selector, "submit button")
+            if not success:
+                raise Exception("Failed to click submit button")
             
-            # Enter the prompt
-            await self.page.fill(self.input_selector, prompt)
-            
-            # Submit the prompt
-            await self.page.click(self.submit_selector)
-            
-            # Small delay after submission
-            await self.page.wait_for_timeout(2000)
+            # Wait for submission to be processed
+            if self.page:
+                await self.page.wait_for_timeout(self.config.RETRY_DELAY)
             
         except Exception as e:
             raise Exception(f"Failed to send prompt to web interface: {str(e)}")
@@ -308,41 +323,24 @@ class WebAgent(CodingAgent):
     async def _wait_for_web_completion(self):
         """Wait for the web agent to complete processing"""
         timeout_seconds = config.agent_timeout_seconds
-        start_time = time.time()
+        timeout_ms = timeout_seconds * 1000
         
         try:
-            while time.time() - start_time < timeout_seconds:
-                # Check if loading indicator is present (if defined)
-                if self.loading_selector:
-                    try:
-                        # If loading indicator is still visible, keep waiting
-                        await self.page.wait_for_selector(
-                            self.loading_selector, 
-                            state="hidden", 
-                            timeout=5000
-                        )
-                        break
-                    except:
-                        # Loading indicator handling failed, fall back to other methods
-                        pass
-                
-                # Check if output area has been updated (basic implementation)
+            # Check if loading indicator is present (if defined)
+            if self.loading_selector and self.page:
                 try:
-                    output_element = await self.page.query_selector(self.output_selector)
-                    if output_element:
-                        output_text = await output_element.text_content()
-                        if output_text and len(output_text.strip()) > 100:  # Arbitrary threshold
-                            # Wait a bit more to ensure completion
-                            await self.page.wait_for_timeout(10000)
-                            break
-                except:
-                    pass
-                
-                # Wait before next check
-                await self.page.wait_for_timeout(5000)
+                    # Wait for loading indicator to disappear
+                    await self.page.wait_for_selector(
+                        self.loading_selector, 
+                        state="hidden", 
+                        timeout=timeout_ms
+                    )
+                    print("Loading indicator disappeared, task likely completed")
+                    return
+                except Exception as e:
+                    print(f"Loading indicator check failed, trying alternative methods: {str(e)}")
             
-            if time.time() - start_time >= timeout_seconds:
-                raise AgentTimeoutException(self.agent_name, timeout_seconds, "Web agent processing timed out")
+            await self._monitor_output_changes(timeout_ms)
                 
         except Exception as e:
             if isinstance(e, AgentTimeoutException):
@@ -356,8 +354,8 @@ class WebAgent(CodingAgent):
             if not self.page:
                 return ""
             
-            # Try to get output from the designated output selector
-            output_element = await self.page.query_selector(self.output_selector)
+            # Try to get output from the designated output selector with robust waiting
+            output_element = await self._get_element_robust(self.output_selector, "output area")
             if output_element:
                 return await output_element.text_content() or ""
             
@@ -386,89 +384,47 @@ class WebAgent(CodingAgent):
                 return False
             
             # Wait for Google login page to be ready
-            await self.page.wait_for_timeout(2000)
+            if self.page:
+                await self.page.wait_for_load_state("networkidle")
             
-            # Handle email input
-            email_input = None
-            for selector in GoogleSelectors.EMAIL_INPUTS:
-                try:
-                    email_input = await self.page.query_selector(selector)
-                    if email_input:
-                        break
-                except:
-                    continue
+            # Handle email input with robust selector fallback
+            email_success = await self._robust_fill_input_from_selectors(
+                GoogleSelectors.EMAIL_INPUTS, 
+                google_email, 
+                "email input"
+            )
             
-            if email_input:
-                await email_input.fill(google_email)
-                
+            if email_success:
                 # Click Next or submit button for email
-                for selector in GoogleSelectors.EMAIL_NEXT_BUTTONS:
-                    try:
-                        next_button = await self.page.query_selector(selector)
-                        if next_button:
-                            await next_button.click()
-                            break
-                    except:
-                        continue
+                next_success = await self._robust_click_from_selectors(
+                    GoogleSelectors.EMAIL_NEXT_BUTTONS,
+                    "email next button"
+                )
                 
-                # Wait for password page
-                await self.page.wait_for_timeout(3000)
+                if next_success and self.page:
+                    # Wait for password page to load
+                    await self.page.wait_for_load_state("networkidle")
             
-            # Handle password input
-            password_input = None
-            for selector in GoogleSelectors.PASSWORD_INPUTS:
-                try:
-                    await self.page.wait_for_selector(selector, timeout=5000)
-                    password_input = await self.page.query_selector(selector)
-                    if password_input:
-                        break
-                except:
-                    continue
+            # Handle password input with robust selector fallback
+            password_success = await self._robust_fill_input_from_selectors(
+                GoogleSelectors.PASSWORD_INPUTS,
+                google_password,
+                "password input"
+            )
             
-            if password_input:
-                await password_input.fill(google_password)
-                
+            if password_success:
                 # Click Next or submit button for password
-                for selector in GoogleSelectors.PASSWORD_NEXT_BUTTONS:
-                    try:
-                        next_button = await self.page.query_selector(selector)
-                        if next_button:
-                            await next_button.click()
-                            break
-                    except:
-                        continue
+                submit_success = await self._robust_click_from_selectors(
+                    GoogleSelectors.PASSWORD_NEXT_BUTTONS,
+                    "password next button"
+                )
                 
-                # Wait for login to complete
-                await self.page.wait_for_timeout(5000)
-                
-                # Check if we're back to the original site (successful login)
-                current_url = self.page.url
-                if 'accounts.google.com' not in current_url:
-                    return True
-                else:
-                    # Check for 2FA or other verification steps with polling
-                    print("Waiting for verification (2FA, etc.)...")
-                    
-                    # Poll every 5 seconds for up to 5 minutes (300 seconds)
-                    max_wait_seconds = 300  # 5 minutes
-                    poll_interval_seconds = 5
-                    elapsed_seconds = 0
-                    
-                    while elapsed_seconds < max_wait_seconds:
-                        await self.page.wait_for_timeout(poll_interval_seconds * 1000)
-                        elapsed_seconds += poll_interval_seconds
-                        
-                        # Check if login completed
-                        current_url = self.page.url
-                        if 'accounts.google.com' not in current_url:
-                            return True
-                    
-                    # Timed out
-                    print("WARNING: Login verification timed out")
-                    return False
-            else:
-                print("ERROR: Could not find password input field")
-                return False
+                if submit_success:
+                    # Wait for login to complete with robust URL monitoring
+                    return await self._wait_for_login_completion()
+            
+            print("ERROR: Failed to complete Google login flow")
+            return False
                 
         except Exception as e:
             print(f"ERROR: Google login failed: {str(e)}")
@@ -480,29 +436,286 @@ class WebAgent(CodingAgent):
             # Check for common captcha types and solve them using Botright
             # This is a basic implementation - subclasses can override for specific captcha handling
             
-            # Try to solve hCaptcha
-            try:
-                await self.page.solve_hcaptcha()
-                return True
-            except:
-                pass
+            if not self.page:
+                print("Page not available for captcha solving")
+                return False
+                
+            captcha_types = [
+                ("hCaptcha", self.page.solve_hcaptcha),
+                ("reCaptcha", self.page.solve_recaptcha),
+                ("geeTest", self.page.solve_geetest)
+            ]
             
-            # Try to solve reCaptcha
-            try:
-                await self.page.solve_recaptcha()
-                return True
-            except:
-                pass
-            
-            # Try to solve geeTest
-            try:
-                await self.page.solve_geetest()
-                return True
-            except:
-                pass
+            for captcha_name, solve_method in captcha_types:
+                try:
+                    print(f"Attempting to solve {captcha_name}...")
+                    await solve_method()
+                    print(f"Successfully solved {captcha_name}")
+                    return True
+                except Exception as e:
+                    print(f"No {captcha_name} found or failed to solve: {str(e)}")
+                    continue
             
             return False
             
         except Exception as e:
             print(f"WARNING: Error during captcha solving: {str(e)}")
-            return False 
+            return False
+    
+    
+    async def _robust_navigate(self, url: str, max_retries: Optional[int] = None) -> bool:
+        """Navigate to URL with retry logic"""
+        max_retries = max_retries or self.config.RETRY_COUNT
+        
+        if not self.page:
+            print("Page not available for navigation")
+            return False
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Navigating to {url} (attempt {attempt + 1}/{max_retries})")
+                await self.page.goto(url, wait_until="networkidle", timeout=self.config.LONG_TIMEOUT)
+                return True
+            except Exception as e:
+                print(f"Navigation attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1 and self.page:
+                    await self.page.wait_for_timeout(self.config.RETRY_DELAY)
+                else:
+                    print(f"Failed to navigate to {url} after {max_retries} attempts")
+                    return False
+        return False
+    
+    async def _wait_for_element_robust(self, selector: str, description: str, timeout: Optional[int] = None, state: str = "visible") -> bool:
+        """Wait for element with robust error handling"""
+        timeout = timeout or self.config.DEFAULT_TIMEOUT
+        
+        try:
+            if not self.page:
+                print(f"Page not available for waiting for {description}")
+                return False
+                
+            await self.page.wait_for_selector(selector, state=state, timeout=timeout)
+            print(f"Successfully found {description}")
+            return True
+        except Exception as e:
+            print(f"Failed to find {description} with selector '{selector}': {str(e)}")
+            return False
+    
+    async def _get_element_robust(self, selector: str, description: str, timeout: Optional[int] = None):
+        """Get element with robust waiting and error handling"""
+        timeout = timeout or self.config.DEFAULT_TIMEOUT
+        
+        try:
+            if not self.page:
+                print(f"Page not available for getting {description}")
+                return None
+                
+            await self.page.wait_for_selector(selector, timeout=timeout)
+            
+            element = await self.page.query_selector(selector)
+            if element:
+                return element
+            else:
+                print(f"Element {description} found but query_selector returned None")
+                return None
+        except Exception as e:
+            print(f"Failed to get {description}: {str(e)}")
+            return None
+    
+    async def _robust_click_element(self, selector: str, description: str, max_retries: Optional[int] = None) -> bool:
+        """Click element with retry logic and actionability checks"""
+        max_retries = max_retries or self.config.RETRY_COUNT
+        
+        for attempt in range(max_retries):
+            try:
+                if not self.page:
+                    raise Exception("Page not available")
+                    
+                # Wait for element to be present and visible
+                await self.page.wait_for_selector(selector, state="visible", timeout=self.config.DEFAULT_TIMEOUT)
+                
+                element = await self.page.query_selector(selector)
+                if not element:
+                    raise Exception(f"Element not found: {selector}")
+                
+                # Check if element is actionable
+                if await element.is_visible() and await element.is_enabled():
+                    await element.scroll_into_view_if_needed()
+                    
+                    # Wait for element to be stable
+                    if self.page:
+                        await self.page.wait_for_timeout(self.config.ELEMENT_STABILITY_TIMEOUT)
+                    
+                    await element.click()
+                    print(f"Successfully clicked {description}")
+                    return True
+                else:
+                    raise Exception(f"Element not actionable: {description}")
+                    
+            except Exception as e:
+                print(f"Click attempt {attempt + 1} failed for {description}: {str(e)}")
+                if attempt < max_retries - 1 and self.page:
+                    await self.page.wait_for_timeout(self.config.RETRY_DELAY)
+                else:
+                    print(f"Failed to click {description} after {max_retries} attempts")
+                    return False
+        return False
+    
+    async def _robust_fill_input(self, selector: str, text: str, max_retries: Optional[int] = None) -> bool:
+        """Fill input field with retry logic and proper clearing"""
+        max_retries = max_retries or self.config.RETRY_COUNT
+        
+        for attempt in range(max_retries):
+            try:
+                if not self.page:
+                    raise Exception("Page not available")
+                    
+                # Wait for input to be present and visible
+                await self.page.wait_for_selector(selector, state="visible", timeout=self.config.DEFAULT_TIMEOUT)
+                
+                input_element = await self.page.query_selector(selector)
+                if not input_element:
+                    raise Exception(f"Input element not found: {selector}")
+                
+                # Check if element is actionable
+                if await input_element.is_visible() and await input_element.is_enabled():
+                    # Focus on the input
+                    await input_element.focus()
+                    
+                    # Clear existing content
+                    await input_element.select_text()
+                    if self.page:
+                        await self.page.keyboard.press("Delete")
+                    
+                    await input_element.fill(text)
+                    
+                    current_value = await input_element.input_value()
+                    if current_value == text:
+                        print(f"Successfully filled input with text (length: {len(text)})")
+                        return True
+                    else:
+                        raise Exception(f"Text verification failed. Expected: {text[:50]}..., Got: {current_value[:50]}...")
+                else:
+                    raise Exception("Input element not actionable")
+                    
+            except Exception as e:
+                print(f"Fill attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1 and self.page:
+                    await self.page.wait_for_timeout(self.config.RETRY_DELAY)
+                else:
+                    print(f"Failed to fill input after {max_retries} attempts")
+                    return False
+        return False
+    
+    async def _robust_fill_input_from_selectors(self, selectors: List[str], text: str, description: str) -> bool:
+        """Try multiple selectors to fill input field"""
+        for selector in selectors:
+            try:
+                if not self.page:
+                    continue
+                    
+                # Check if this selector exists
+                element = await self.page.query_selector(selector)
+                if element and await element.is_visible():
+                    success = await self._robust_fill_input(selector, text)
+                    if success:
+                        print(f"Successfully filled {description} using selector: {selector}")
+                        return True
+            except Exception as e:
+                print(f"Selector {selector} failed for {description}: {str(e)}")
+                continue
+        
+        print(f"Failed to fill {description} with any of the provided selectors")
+        return False
+    
+    async def _robust_click_from_selectors(self, selectors: List[str], description: str) -> bool:
+        """Try multiple selectors to click element"""
+        for selector in selectors:
+            try:
+                if not self.page:
+                    continue
+                    
+                # Check if this selector exists
+                element = await self.page.query_selector(selector)
+                if element and await element.is_visible() and await element.is_enabled():
+                    success = await self._robust_click_element(selector, description)
+                    if success:
+                        print(f"Successfully clicked {description} using selector: {selector}")
+                        return True
+            except Exception as e:
+                print(f"Selector {selector} failed for {description}: {str(e)}")
+                continue
+        
+        print(f"Failed to click {description} with any of the provided selectors")
+        return False
+    
+    async def _wait_for_login_completion(self, max_wait_seconds: int = 300) -> bool:
+        """Wait for login to complete by monitoring URL changes"""
+        poll_interval_ms = 5000  # 5 seconds
+        elapsed_ms = 0
+        max_wait_ms = max_wait_seconds * 1000
+        
+        if not self.page:
+            print("Page not available for login completion check")
+            return False
+        
+        try:
+            while elapsed_ms < max_wait_ms:
+                await self.page.wait_for_timeout(poll_interval_ms)
+                elapsed_ms += poll_interval_ms
+                
+                current_url = self.page.url
+                if 'accounts.google.com' not in current_url:
+                    print("Login completed successfully")
+                    return True
+                    
+                print(f"Still on Google login page, waiting... ({elapsed_ms/1000}s elapsed)")
+            
+            print("Login verification timed out")
+            return False
+            
+        except Exception as e:
+            print(f"Error waiting for login completion: {str(e)}")
+            return False
+    
+    async def _monitor_output_changes(self, timeout_ms: int):
+        """Monitor output area for content changes to detect completion"""
+        check_interval_ms = 5000  # 5 seconds
+        stable_content_duration_ms = 10000  # 10 seconds of stable content
+        
+        last_content = ""
+        last_change_time = time.time() * 1000
+        start_time = time.time() * 1000
+        
+        while (time.time() * 1000) - start_time < timeout_ms:
+            try:
+                output_element = None
+                if self.page:
+                    output_element = await self.page.query_selector(self.output_selector)
+                current_content = ""
+                if output_element:
+                    current_content = await output_element.text_content() or ""
+                
+                # Check if content has changed
+                if current_content != last_content:
+                    last_content = current_content
+                    last_change_time = time.time() * 1000
+                    print(f"Output content changed (length: {len(current_content)})")
+                
+                # Check if content has been stable for the required duration
+                current_time = time.time() * 1000
+                if (current_time - last_change_time) >= stable_content_duration_ms and len(current_content) > 100:
+                    print("Output content appears stable, assuming completion")
+                    return
+                
+                # Wait before next check
+                if self.page:
+                    await self.page.wait_for_timeout(check_interval_ms)
+                
+            except Exception as e:
+                print(f"Error monitoring output changes: {str(e)}")
+                if self.page:
+                    await self.page.wait_for_timeout(check_interval_ms)
+        
+        timeout_seconds = int(timeout_ms / 1000)
+        raise AgentTimeoutException(self.agent_name, timeout_seconds, "Web agent processing timed out")                

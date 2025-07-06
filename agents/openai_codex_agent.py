@@ -224,15 +224,22 @@ class OpenAICodexAgent(WebAgent):
         try:
             # Look for repository in environments table using proven selector
             repo_selector = CodexSelectors.EXISTING_REPO_ROW.format(repo_name=repo_name)
-            element = await self.page.query_selector(repo_selector)
+            
+            # Wait for the table to load
+            await self.page.wait_for_load_state("networkidle")
+            
+            element = await self._get_element_robust(repo_selector, f"existing environment for {repo_name}")
             
             if element:
-                await element.click()
-                await self.page.wait_for_timeout(2000)
-                return await self._click_element(CodexSelectors.USE_THIS_BUTTON, "Use this button")
+                success = await self._robust_click_element(repo_selector, f"repository row for {repo_name}")
+                if success:
+                    # Wait for selection to process
+                    await self.page.wait_for_timeout(2000)
+                    return await self._robust_click_element(CodexSelectors.USE_THIS_BUTTON, "Use this button")
             
             return False
         except Exception as e:
+            print(f"Error finding existing environment: {str(e)}")
             return False
 
     async def _create_new_environment(self, repo_name: str) -> bool:
@@ -259,7 +266,8 @@ class OpenAICodexAgent(WebAgent):
                 return False
             
             # Click final create button using proven selector
-            await self.page.wait_for_timeout(2000)
+            if self.page:
+                await self.page.wait_for_timeout(2000)
             final_create_element = await self.page.query_selector(CodexSelectors.FINAL_CREATE_BUTTON)
             
             if final_create_element and await final_create_element.is_visible():
@@ -302,16 +310,14 @@ class OpenAICodexAgent(WebAgent):
     async def _send_prompt(self, prompt: str):
         """Send prompt to the Codex interface"""
         
-        # Wait for and fill input field
-        await self._wait_for_element(CodexSelectors.PROMPT_INPUT, "prompt input")
-        input_field = await self.page.query_selector(CodexSelectors.PROMPT_INPUT)
+        success = await self._robust_fill_input(CodexSelectors.PROMPT_INPUT, prompt)
+        if not success:
+            raise Exception("Failed to fill prompt input")
         
-        await input_field.click()
-        await self.page.keyboard.press("Control+a")
-        await input_field.fill(prompt)
-        
-        # Click Code button
-        await self._click_element(CodexSelectors.CODE_BUTTON, "Code button")
+        # Click Code button with robust method
+        success = await self._robust_click_element(CodexSelectors.CODE_BUTTON, "Code button")
+        if not success:
+            raise Exception("Failed to click Code button")
 
     async def _open_created_task(self) -> bool:
         """Find and open the newly created task"""
@@ -398,15 +404,28 @@ class OpenAICodexAgent(WebAgent):
     async def _wait_for_completion(self):
         """Wait for task completion by monitoring stop button"""
         try:
-            # Wait for stop button to appear (proven selector)
-            await self.page.wait_for_selector(CodexSelectors.STOP_BUTTON, timeout=30000)
+            # Wait for stop button to appear with robust waiting
+            stop_button_appeared = await self._wait_for_element_robust(
+                CodexSelectors.STOP_BUTTON, 
+                "stop button", 
+                timeout=30000
+            )
             
-            # Wait for stop button to disappear (proven selector)
-            await self.page.wait_for_selector(CodexSelectors.STOP_BUTTON, state="hidden", timeout=1200000)
+            if stop_button_appeared:
+                # Wait for stop button to disappear (task completion)
+                await self.page.wait_for_selector(
+                    CodexSelectors.STOP_BUTTON, 
+                    state="hidden", 
+                    timeout=1200000
+                )
+                print("Stop button disappeared, task completed")
+            else:
+                print("WARNING: Stop button never appeared, task may have completed immediately")
             
-        except:
-            print("WARNING: Could not monitor task completion")
+        except Exception as e:
+            print(f"WARNING: Could not monitor task completion: {str(e)}")
         
+        # Wait for any final processing
         await self.page.wait_for_timeout(2000)
 
     async def _try_create_pr(self):
@@ -445,37 +464,30 @@ class OpenAICodexAgent(WebAgent):
 
     async def _wait_for_element(self, selector: str, description: str, timeout: int = 10000):
         """Wait for an element to appear"""
-        try:
-            await self.page.wait_for_selector(selector, timeout=timeout)
-        except:
-            print(f"WARNING: Timeout waiting for {description}")
+        return await self._wait_for_element_robust(selector, description, timeout)
 
     async def _click_element(self, selector: str, description: str) -> bool:
         """Find and click an element"""
-        try:
-            element = await self.page.query_selector(selector)
-            if element and await element.is_visible() and await element.is_enabled():
-                await element.click()
-                await self.page.wait_for_timeout(1000)
-                return True
-            
-            print(f"ERROR: Could not click {description}")
-            return False
-            
-        except Exception as e:
-            print(f"ERROR: Failed to click {description}: {str(e)}")
-            return False
+        return await self._robust_click_element(selector, description)
 
     async def _scroll_and_click(self, element, description: str):
         """Scroll element into view and click it"""
         try:
             await element.scroll_into_view_if_needed()
-            await self.page.wait_for_timeout(500)
             
-            try:
-                await element.click()
-            except:
-                await element.evaluate("element => element.click()")
+            # Wait for element to be stable
+            await self.page.wait_for_timeout(self.config.ELEMENT_STABILITY_TIMEOUT)
+            
+            if await element.is_visible() and await element.is_enabled():
+                try:
+                    await element.click()
+                    print(f"Successfully clicked {description}")
+                except Exception:
+                    # Fallback to JavaScript click
+                    await element.evaluate("element => element.click()")
+                    print(f"Successfully clicked {description} using JavaScript fallback")
+            else:
+                raise Exception(f"Element {description} not actionable after scrolling")
                 
         except Exception as e:
             print(f"ERROR: Failed to click {description}: {str(e)}")
@@ -483,8 +495,23 @@ class OpenAICodexAgent(WebAgent):
     async def _wait_for_loading_complete(self):
         """Wait for any loading indicators to complete"""
         try:
-            # Use proven loading selector
-            await self.page.wait_for_selector(CodexSelectors.LOADING, timeout=5000)
-            await self.page.wait_for_selector(CodexSelectors.LOADING, state="hidden", timeout=30000)
-        except:
-            pass  # No loading indicator found or already completed 
+            # Check if loading indicator appears
+            loading_appeared = await self._wait_for_element_robust(
+                CodexSelectors.LOADING, 
+                "loading indicator", 
+                timeout=5000
+            )
+            
+            if loading_appeared:
+                # Wait for loading to complete
+                await self.page.wait_for_selector(
+                    CodexSelectors.LOADING, 
+                    state="hidden", 
+                    timeout=30000
+                )
+                print("Loading completed")
+            else:
+                print("No loading indicator found, assuming already loaded")
+                
+        except Exception as e:
+            print(f"Loading check completed with warning: {str(e)}")   
